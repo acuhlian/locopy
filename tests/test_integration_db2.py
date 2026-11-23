@@ -21,19 +21,27 @@ them with environment variables:
 ``LOCOPY_DB2_DSN``
     Full ``KEY=VALUE;`` connection string, for example
     ``DATABASE=testdb;HOSTNAME=localhost;PORT=50000;PROTOCOL=TCPIP;``
+``LOCOPY_DB2_SSL_DSN`` (optional)
+    A second connection string using SSL/TLS, for example
+    ``DATABASE=testdb;HOSTNAME=localhost;PORT=50001;PROTOCOL=TCPIP;``
+    ``SECURITY=SSL;SSLServerCertificate=/path/to/server.arm;``. When set, every
+    test also runs over SSL, plus the SSL failure-mode tests.
 ``LOCOPY_DB2_USER`` / ``LOCOPY_DB2_PASSWORD``
     Credentials (optional when they are already in the DSN).
 
 A throwaway server can be started with Db2 Community Edition::
 
-    docker run -d --name db2 --privileged -p 50000:50000 \\
+    docker run -d --name db2 --privileged -p 50000:50000 -p 50001:50001 \\
         -e LICENSE=accept -e DB2INST1_PASSWORD=<password> -e DBNAME=testdb \\
         icr.io/db2_community/db2
+
+and SSL enabled on it with ``.github/scripts/db2-enable-ssl.sh``.
 """
 
 import datetime
 import decimal
 import os
+import re
 import uuid
 
 import locopy
@@ -44,23 +52,40 @@ import pytest
 ibm_db_dbi = pytest.importorskip("ibm_db_dbi")
 
 DSN = os.environ.get("LOCOPY_DB2_DSN")
-CREDS = {
-    "dsn": DSN,
-    "user": os.environ.get("LOCOPY_DB2_USER", ""),
-    "password": os.environ.get("LOCOPY_DB2_PASSWORD", ""),
-}
+SSL_DSN = os.environ.get("LOCOPY_DB2_SSL_DSN")
+USER = os.environ.get("LOCOPY_DB2_USER", "")
+PASSWORD = os.environ.get("LOCOPY_DB2_PASSWORD", "")
+
+CONNECTIONS = [pytest.param(DSN, id="tcpip")]
+if SSL_DSN:
+    CONNECTIONS.append(pytest.param(SSL_DSN, id="ssl"))
 
 pytestmark = [
     pytest.mark.integration,
     pytest.mark.skipif(not DSN, reason="LOCOPY_DB2_DSN is not set"),
 ]
 
+requires_ssl = pytest.mark.skipif(not SSL_DSN, reason="LOCOPY_DB2_SSL_DSN is not set")
+
+
+@pytest.fixture(params=CONNECTIONS)
+def creds(request):
+    """Connection kwargs, once per configured transport (plain TCP/IP, SSL)."""
+    return {"dsn": request.param, "user": USER, "password": PASSWORD}
+
+
+def _without(dsn, *keys):
+    """Remove ``KEY=value;`` pairs from a Db2 connection string."""
+    for key in keys:
+        dsn = re.sub(rf"(?i){key}=[^;]*;?", "", dsn)
+    return dsn
+
 
 @pytest.fixture()
-def table():
+def table(creds):
     """Create a uniquely named table and drop it afterwards."""
     name = f"LOCOPY_TEST_{uuid.uuid4().hex[:8].upper()}"
-    with locopy.Database(dbapi=ibm_db_dbi, **CREDS) as db:
+    with locopy.Database(dbapi=ibm_db_dbi, **creds) as db:
         db.execute(
             f"CREATE TABLE {name} ("
             "id INTEGER NOT NULL, "
@@ -72,7 +97,7 @@ def table():
             "updated TIMESTAMP)"
         )
     yield name
-    with locopy.Database(dbapi=ibm_db_dbi, **CREDS) as db:
+    with locopy.Database(dbapi=ibm_db_dbi, **creds) as db:
         db.execute(f"DROP TABLE {name}")
 
 
@@ -90,8 +115,8 @@ ROWS = [
 ]
 
 
-def test_db2_select_single_row():
-    with locopy.Database(dbapi=ibm_db_dbi, **CREDS) as db:
+def test_db2_select_single_row(creds):
+    with locopy.Database(dbapi=ibm_db_dbi, **creds) as db:
         db.execute("SELECT 1 AS field_1, 'a' AS field_2 FROM SYSIBM.SYSDUMMY1")
         assert db.column_names() == ["field_1", "field_2"]
         df = db.to_dataframe()
@@ -99,8 +124,8 @@ def test_db2_select_single_row():
     assert df.to_dict("records") == [{"field_1": 1, "field_2": "a"}]
 
 
-def test_db2_select_multiple_rows_polars():
-    with locopy.Database(dbapi=ibm_db_dbi, **CREDS) as db:
+def test_db2_select_multiple_rows_polars(creds):
+    with locopy.Database(dbapi=ibm_db_dbi, **creds) as db:
         db.execute(
             "SELECT 1 AS field_1 FROM SYSIBM.SYSDUMMY1 "
             "UNION ALL SELECT 2 FROM SYSIBM.SYSDUMMY1 ORDER BY 1"
@@ -111,8 +136,8 @@ def test_db2_select_multiple_rows_polars():
     assert df["field_1"].to_list() == [1, 2]
 
 
-def test_db2_qmark_params_and_executemany(table):
-    with locopy.Database(dbapi=ibm_db_dbi, **CREDS) as db:
+def test_db2_qmark_params_and_executemany(creds, table):
+    with locopy.Database(dbapi=ibm_db_dbi, **creds) as db:
         db.execute(
             f"INSERT INTO {table} VALUES (?, ?, ?, ?, ?, ?, ?)",
             params=ROWS,
@@ -134,8 +159,8 @@ def test_db2_qmark_params_and_executemany(table):
     ]
 
 
-def test_db2_nulls_to_dataframe(table):
-    with locopy.Database(dbapi=ibm_db_dbi, **CREDS) as db:
+def test_db2_nulls_to_dataframe(creds, table):
+    with locopy.Database(dbapi=ibm_db_dbi, **creds) as db:
         db.execute(
             f"INSERT INTO {table} VALUES (?, ?, ?, ?, ?, ?, ?)",
             params=ROWS,
@@ -157,8 +182,8 @@ def test_db2_nulls_to_dataframe(table):
     assert pd.isna(df.loc[1, "label"])
 
 
-def test_db2_fetch_in_chunks(table):
-    with locopy.Database(dbapi=ibm_db_dbi, **CREDS) as db:
+def test_db2_fetch_in_chunks(creds, table):
+    with locopy.Database(dbapi=ibm_db_dbi, **creds) as db:
         db.execute(
             f"INSERT INTO {table} (id) VALUES (?)",
             params=[(i,) for i in range(10)],
@@ -172,28 +197,48 @@ def test_db2_fetch_in_chunks(table):
     assert second["id"].tolist() == [4, 5, 6, 7]
 
 
-def test_db2_commit_false_is_rolled_back(table):
+def test_db2_commit_false_is_rolled_back(creds, table):
     # ibm_db_dbi starts with autocommit off, so an uncommitted insert must
     # disappear when the connection closes.
-    with locopy.Database(dbapi=ibm_db_dbi, **CREDS) as db:
+    with locopy.Database(dbapi=ibm_db_dbi, **creds) as db:
         db.execute(f"INSERT INTO {table} (id) VALUES (1)", commit=False)
         db.conn.rollback()
 
-    with locopy.Database(dbapi=ibm_db_dbi, **CREDS) as db:
+    with locopy.Database(dbapi=ibm_db_dbi, **creds) as db:
         db.execute(f"SELECT COUNT(*) AS n FROM {table}")
         assert db.to_dataframe()["n"].tolist() == [0]
 
 
-def test_db2_bad_sql_raises_dberror():
+def test_db2_bad_sql_raises_dberror(creds):
     with (
-        locopy.Database(dbapi=ibm_db_dbi, **CREDS) as db,
+        locopy.Database(dbapi=ibm_db_dbi, **creds) as db,
         pytest.raises(locopy.errors.DBError),
     ):
         db.execute("SELECT * FROM LOCOPY_TABLE_THAT_DOES_NOT_EXIST")
 
 
-def test_db2_bad_password_raises_dberror():
-    creds = {**CREDS, "password": "definitely-wrong"}
+def test_db2_bad_password_raises_dberror(creds):
+    creds = {**creds, "password": "definitely-wrong"}
     db = locopy.Database(dbapi=ibm_db_dbi, **creds)
+    with pytest.raises(locopy.errors.DBError):
+        db.connect()
+
+
+@requires_ssl
+def test_db2_ssl_without_server_certificate_raises_dberror():
+    # A self-signed server certificate is not trusted unless the client is
+    # told about it, so the TLS handshake must fail rather than connect.
+    dsn = _without(SSL_DSN, "SSLServerCertificate")
+    db = locopy.Database(dbapi=ibm_db_dbi, dsn=dsn, user=USER, password=PASSWORD)
+    with pytest.raises(locopy.errors.DBError):
+        db.connect()
+
+
+@requires_ssl
+def test_db2_plain_tcpip_to_ssl_port_raises_dberror():
+    # Forgetting SECURITY=SSL against an SSL-only port must fail, not connect
+    # unencrypted.
+    dsn = _without(SSL_DSN, "SECURITY", "SSLServerCertificate")
+    db = locopy.Database(dbapi=ibm_db_dbi, dsn=dsn, user=USER, password=PASSWORD)
     with pytest.raises(locopy.errors.DBError):
         db.connect()
