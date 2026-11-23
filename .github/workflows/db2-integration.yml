@@ -1,0 +1,80 @@
+# Runs the Db2 integration tests against a throwaway Db2 Community Edition
+# container. No secrets are needed: the container and its password exist only
+# for the lifetime of the job.
+name: Db2 integration
+
+on:
+  pull_request:
+    branches: [develop, main]
+    paths:
+      - "locopy/database.py"
+      - "tests/test_integration_db2.py"
+      - ".github/workflows/db2-integration.yml"
+      - ".github/scripts/db2-enable-ssl.sh"
+      - "pyproject.toml"
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  db2:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      DB2_PASSWORD: locopy_ci_only
+      LOCOPY_DB2_DSN: "DATABASE=testdb;HOSTNAME=localhost;PORT=50000;PROTOCOL=TCPIP;"
+      # SSLServerCertificate is appended once the certificate exists.
+      LOCOPY_DB2_SSL_BASE_DSN: "DATABASE=testdb;HOSTNAME=localhost;PORT=50001;PROTOCOL=TCPIP;SECURITY=SSL;"
+      LOCOPY_DB2_USER: db2inst1
+      LOCOPY_DB2_PASSWORD: locopy_ci_only
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Start Db2 Community Edition
+        run: |
+          docker run -d --name db2 --privileged -p 50000:50000 -p 50001:50001 \
+            -e LICENSE=accept \
+            -e DB2INST1_PASSWORD="$DB2_PASSWORD" \
+            -e DBNAME=testdb \
+            -e ARCHIVE_LOGS=false \
+            -e AUTOCONFIG=false \
+            -e PERSISTENT_HOME=false \
+            icr.io/db2_community/db2:12.1.5.0
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: python -m pip install .[tests,db2]
+
+      - name: Wait for Db2 to finish setup
+        timeout-minutes: 15
+        run: |
+          until docker logs db2 2>&1 | grep -q "Setup has completed"; do
+            if [ "$(docker inspect -f '{{.State.Running}}' db2)" != "true" ]; then
+              docker logs db2
+              exit 1
+            fi
+            sleep 10
+          done
+
+      - name: Enable SSL with a throwaway self-signed certificate
+        timeout-minutes: 5
+        run: |
+          .github/scripts/db2-enable-ssl.sh db2 "$RUNNER_TEMP/db2-server.arm"
+          echo "LOCOPY_DB2_SSL_DSN=${LOCOPY_DB2_SSL_BASE_DSN}SSLServerCertificate=$RUNNER_TEMP/db2-server.arm;" >> "$GITHUB_ENV"
+
+      - name: Run Db2 integration tests (TCP/IP and SSL)
+        # A client using SSL against a plain port can hang instead of failing,
+        # so cap the step rather than relying on driver timeouts.
+        timeout-minutes: 5
+        run: pytest --verbose tests/test_integration_db2.py
+
+      - name: Db2 logs on failure
+        if: failure()
+        run: docker logs db2 | tail -200
